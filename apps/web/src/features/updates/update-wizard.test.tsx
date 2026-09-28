@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { screen, fireEvent, within, waitFor } from "@testing-library/react";
-import type { Site } from "@wpmgr/api";
+import type { Site, UpdateRunCreate } from "@wpmgr/api";
 
 import { renderWithProviders } from "@/test/render";
 
@@ -493,7 +493,9 @@ describe("UpdateWizard — PR #752 Select all / Deselect all (GH #680)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /preview 2 updates/i }));
     await waitFor(() => expect(createUpdateRunMock).toHaveBeenCalledTimes(1));
-    const body = createUpdateRunMock.mock.calls[0][0].body;
+    const [{ body }] = createUpdateRunMock.mock.calls[0] as [
+      { body: UpdateRunCreate },
+    ];
     expect(body.site_ids).toEqual(["site-a"]);
     expect(body.dry_run).toBe(true);
     expect(body.items).toEqual([
