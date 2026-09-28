@@ -6,6 +6,20 @@ import { renderWithProviders } from "@/test/render";
 
 import { UpdateWizard, type WizardTarget } from "./update-wizard";
 
+// Hoisted mock of the generated create-update-run call. `vi.mock` is hoisted
+// above every import by Vitest regardless of where it's written in the file,
+// so this applies to the WHOLE file, not only the PR #752 tests below that
+// exercise submission — kept next to the imports rather than buried under
+// that describe block so that scope is obvious at a glance.
+const { createUpdateRunMock } = vi.hoisted(() => ({
+  createUpdateRunMock: vi.fn(),
+}));
+
+vi.mock("@wpmgr/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@wpmgr/api")>();
+  return { ...actual, createUpdateRun: createUpdateRunMock };
+});
+
 // GH #211 — a WordPress update transient can occasionally report
 // `new_version` equal to the already-installed `version` (observed with
 // Kadence: "1.5.1 -> 1.5.1"). The bulk-update wizard used to treat any
@@ -381,14 +395,6 @@ describe("UpdateWizard — GH #463 a refused schedule is never silent", () => {
 // top of update-wizard.tsx); these tests pin what the toggle does to
 // `selectedSlugs`, scoped to the ACTIVE tab's `hasUpdate` keys only —
 // `activeUpdatableKeys` and `toggleSelectAll` in update-wizard.tsx.
-const { createUpdateRunMock } = vi.hoisted(() => ({
-  createUpdateRunMock: vi.fn(),
-}));
-
-vi.mock("@wpmgr/api", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@wpmgr/api")>();
-  return { ...actual, createUpdateRun: createUpdateRunMock };
-});
 
 /** The checkbox `<input>` for a labeled row, found via its visible text. */
 function checkboxFor(label: string): HTMLInputElement {
@@ -504,6 +510,23 @@ describe("UpdateWizard — PR #752 Select all / Deselect all (GH #680)", () => {
     ]);
   });
 
+  it("1b. hand-ticking a single row (no Select all) posts exactly that row, not every updatable item on the tab", async () => {
+    await openWizard();
+    fireEvent.click(checkboxFor("Woo"));
+    expect(screen.getByText("1 item will be previewed.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /preview 1 update/i }));
+    await waitFor(() => expect(createUpdateRunMock).toHaveBeenCalledTimes(1));
+    const [{ body }] = createUpdateRunMock.mock.calls[0] as [
+      { body: UpdateRunCreate },
+    ];
+    // Yoast also has an update and is on the same tab, but was never
+    // ticked — it must not ride along in the POST body.
+    expect(body.items).toEqual([
+      { type: "plugin", slug: "woo", version: "latest" },
+    ]);
+  });
+
   it("2. show all: Select all ticks only rows with a real update; up-to-date rows stay unticked", async () => {
     await openWizard();
     fireEvent.click(screen.getByRole("button", { name: "Show all" }));
@@ -521,6 +544,14 @@ describe("UpdateWizard — PR #752 Select all / Deselect all (GH #680)", () => {
 
   it("3. partial selection: Select all fills in the rest and keeps what was already ticked", async () => {
     await openWizard();
+    // A row that is NOT one of the active tab's updatable keys, ticked
+    // before Select all: an up-to-date row on this tab, revealed via "Show
+    // all". If Select all rebuilt the set from scratch instead of adding to
+    // it, this tick would be the one thing that could show that, since
+    // "Woo" alone (an updatable key) would survive a from-scratch rebuild
+    // too.
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    fireEvent.click(checkboxFor("Akismet"));
     fireEvent.click(checkboxFor("Woo"));
     expect(
       screen.getByRole("button", { name: "Select all available updates" }),
@@ -532,7 +563,10 @@ describe("UpdateWizard — PR #752 Select all / Deselect all (GH #680)", () => {
 
     expect(checkboxFor("Woo").checked).toBe(true);
     expect(checkboxFor("Yoast").checked).toBe(true);
-    expect(screen.getByText("2 items will be previewed.")).toBeInTheDocument();
+    // The pre-ticked up-to-date row, not itself one of the keys Select all
+    // touches, must still be ticked afterwards.
+    expect(checkboxFor("Akismet").checked).toBe(true);
+    expect(screen.getByText("3 items will be previewed.")).toBeInTheDocument();
   });
 
   it("4. deselect all: removes only this tab's updatable keys; a hand-picked up-to-date row and the other tab's picks survive", async () => {
@@ -569,6 +603,35 @@ describe("UpdateWizard — PR #752 Select all / Deselect all (GH #680)", () => {
     expect(checkboxFor("Astra").checked).toBe(true);
   });
 
+  it("4b. submits every selected slug across tabs, including an up-to-date row and a theme — not just the active tab's updatable keys", async () => {
+    await openWizard();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    // Hand-picked up-to-date row on the ACTIVE (plugins) tab.
+    fireEvent.click(checkboxFor("Akismet"));
+
+    // A pick on the OTHER tab (themes).
+    fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
+    fireEvent.click(checkboxFor("Astra"));
+    fireEvent.click(screen.getByRole("tab", { name: /plugins/i }));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    );
+    expect(screen.getByText("4 items will be previewed.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /preview 4 updates/i }));
+    await waitFor(() => expect(createUpdateRunMock).toHaveBeenCalledTimes(1));
+    const [{ body }] = createUpdateRunMock.mock.calls[0] as [
+      { body: UpdateRunCreate },
+    ];
+    // Every selected slug is posted: the two Select-all'd plugin updates,
+    // the hand-picked up-to-date plugin (no update, so a filter keyed on
+    // "has an update" would drop it), and the theme picked on the other tab
+    // (so a filter keyed on "currently visible on this tab" would drop it).
+    const slugs = body.items.map((item) => item.slug).sort();
+    expect(slugs).toEqual(["akismet", "astra", "woo", "yoast"]);
+  });
+
   it("5. the other tab is untouched by Select all", async () => {
     await openWizard();
     fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
@@ -583,6 +646,22 @@ describe("UpdateWizard — PR #752 Select all / Deselect all (GH #680)", () => {
     fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
     expect(checkboxFor("Astra").checked).toBe(true);
     expect(screen.getByText("3 items will be previewed.")).toBeInTheDocument();
+  });
+
+  it("7. Select all works on the Themes tab itself, not just Plugins", async () => {
+    await openWizard();
+    fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
+    expect(checkboxFor("Astra").checked).toBe(false);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    );
+
+    expect(checkboxFor("Astra").checked).toBe(true);
+    expect(screen.getByText("1 item will be previewed.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Deselect all available updates" }),
+    ).toHaveTextContent("Deselect all");
   });
 
   it("6. no Select all button when the active tab has zero available updates", async () => {
