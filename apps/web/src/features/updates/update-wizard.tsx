@@ -39,8 +39,10 @@ import type { Site, UpdateItem, UpdateRunCreate } from "@wpmgr/api";
 //   1. updateKind in WizardTarget drives the active tab/section (plugins,
 //      themes, or core) so the split-button selection is honoured.
 //   2. Components default to "has update" filter — only items with a
-//      new_version reported by the agent are pre-checked. Items without an
-//      update are hidden by default (operator can reveal via "Show all").
+//      new_version reported by the agent are shown. Items without an update
+//      are hidden by default (operator can reveal via "Show all"). Selection
+//      itself starts EMPTY; the operator ticks items individually or via the
+//      per-tab "Select all" toggle (GH #680).
 //   3. Plugins and themes are separated into tabs with their own lists.
 
 export type WizardUpdateKind = "plugins" | "themes" | "core";

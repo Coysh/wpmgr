@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { screen, fireEvent, within } from "@testing-library/react";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { screen, fireEvent, within, waitFor } from "@testing-library/react";
 import type { Site } from "@wpmgr/api";
 
 import { renderWithProviders } from "@/test/render";
@@ -373,5 +373,235 @@ describe("UpdateWizard — GH #463 a refused schedule is never silent", () => {
       "aria-invalid",
     );
     expect(screen.getByRole("button", { name: /preview|apply/i })).toBeEnabled();
+  });
+});
+
+// PR #752 (GH #680) — "Select all" / "Deselect all" for the active tab's
+// available updates. Selection starts EMPTY (see the header comment at the
+// top of update-wizard.tsx); these tests pin what the toggle does to
+// `selectedSlugs`, scoped to the ACTIVE tab's `hasUpdate` keys only —
+// `activeUpdatableKeys` and `toggleSelectAll` in update-wizard.tsx.
+const { createUpdateRunMock } = vi.hoisted(() => ({
+  createUpdateRunMock: vi.fn(),
+}));
+
+vi.mock("@wpmgr/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@wpmgr/api")>();
+  return { ...actual, createUpdateRun: createUpdateRunMock };
+});
+
+/** The checkbox `<input>` for a labeled row, found via its visible text. */
+function checkboxFor(label: string): HTMLInputElement {
+  const row = screen.getByText(label).closest("label");
+  if (!row) throw new Error(`no <label> ancestor for "${label}"`);
+  const input = row.querySelector("input[type=checkbox]");
+  if (!input) throw new Error(`no checkbox in the "${label}" row`);
+  return input as HTMLInputElement;
+}
+
+describe("UpdateWizard — PR #752 Select all / Deselect all (GH #680)", () => {
+  const SITE = buildSite({
+    id: "site-a",
+    components: {
+      plugins: [
+        {
+          slug: "woo",
+          name: "Woo",
+          version: "8.0",
+          available_update: { new_version: "8.1" },
+        },
+        {
+          slug: "yoast",
+          name: "Yoast",
+          version: "20",
+          available_update: { new_version: "21" },
+        },
+        // Up to date — no available_update at all.
+        { slug: "akismet", name: "Akismet", version: "5.3" },
+        // GH #211 phantom same-version advisory: hasUpdate is false for
+        // this one, so Select all must never tick it.
+        {
+          slug: "kadence",
+          name: "Kadence",
+          version: "1.5.1",
+          available_update: { new_version: "1.5.1" },
+        },
+      ],
+      themes: [
+        {
+          slug: "astra",
+          name: "Astra",
+          version: "4",
+          available_update: { new_version: "4.1" },
+        },
+        { slug: "tt4", name: "Twenty Twenty-Four", version: "1.0" },
+      ],
+    },
+  });
+
+  const TARGET: WizardTarget = {
+    kind: "sites",
+    siteIds: ["site-a"],
+    updateKind: "plugins",
+  };
+
+  beforeEach(() => {
+    createUpdateRunMock.mockReset();
+    createUpdateRunMock.mockResolvedValue({
+      data: { id: "run-1" },
+      error: undefined,
+      response: { status: 201 },
+    });
+  });
+
+  async function openWizard(
+    sites: Site[] = [SITE],
+    target: WizardTarget = TARGET,
+  ) {
+    renderWithProviders(
+      <UpdateWizard open target={target} sites={sites} onClose={() => {}} />,
+      { withRouter: true },
+    );
+    // First paint is async under the test router — see test/render.tsx.
+    await screen.findByRole("tab", { name: /plugins/i });
+  }
+
+  it("1. filter on: Select all ticks exactly the visible rows with a real update, and posts exactly those", async () => {
+    await openWizard();
+    expect(
+      screen.getByText("Select at least one thing to update."),
+    ).toBeInTheDocument();
+    expect(checkboxFor("Woo").checked).toBe(false);
+    expect(checkboxFor("Yoast").checked).toBe(false);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    );
+
+    expect(checkboxFor("Woo").checked).toBe(true);
+    expect(checkboxFor("Yoast").checked).toBe(true);
+    expect(screen.getByText("2 items will be previewed.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Deselect all available updates" }),
+    ).toHaveTextContent("Deselect all");
+
+    // The hidden up-to-date row and the hidden phantom-update row were never
+    // ticked, even though they were never visible to click.
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(checkboxFor("Akismet").checked).toBe(false);
+    expect(checkboxFor("Kadence").checked).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: /preview 2 updates/i }));
+    await waitFor(() => expect(createUpdateRunMock).toHaveBeenCalledTimes(1));
+    const body = createUpdateRunMock.mock.calls[0][0].body;
+    expect(body.site_ids).toEqual(["site-a"]);
+    expect(body.dry_run).toBe(true);
+    expect(body.items).toEqual([
+      { type: "plugin", slug: "woo", version: "latest" },
+      { type: "plugin", slug: "yoast", version: "latest" },
+    ]);
+  });
+
+  it("2. show all: Select all ticks only rows with a real update; up-to-date rows stay unticked", async () => {
+    await openWizard();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    );
+
+    expect(checkboxFor("Woo").checked).toBe(true);
+    expect(checkboxFor("Yoast").checked).toBe(true);
+    expect(checkboxFor("Akismet").checked).toBe(false);
+    expect(checkboxFor("Kadence").checked).toBe(false);
+    expect(screen.getByText("2 items will be previewed.")).toBeInTheDocument();
+  });
+
+  it("3. partial selection: Select all fills in the rest and keeps what was already ticked", async () => {
+    await openWizard();
+    fireEvent.click(checkboxFor("Woo"));
+    expect(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    ).toHaveTextContent("Select all");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    );
+
+    expect(checkboxFor("Woo").checked).toBe(true);
+    expect(checkboxFor("Yoast").checked).toBe(true);
+    expect(screen.getByText("2 items will be previewed.")).toBeInTheDocument();
+  });
+
+  it("4. deselect all: removes only this tab's updatable keys; a hand-picked up-to-date row and the other tab's picks survive", async () => {
+    await openWizard();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    // Hand-picked up-to-date row on the ACTIVE (plugins) tab.
+    fireEvent.click(checkboxFor("Akismet"));
+
+    // A pick on the OTHER tab (themes).
+    fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
+    fireEvent.click(checkboxFor("Astra"));
+    fireEvent.click(screen.getByRole("tab", { name: /plugins/i }));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    );
+    expect(checkboxFor("Woo").checked).toBe(true);
+    expect(checkboxFor("Yoast").checked).toBe(true);
+    expect(screen.getByText("4 items will be previewed.")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Deselect all available updates" }),
+    );
+
+    // Only woo/yoast (this tab's updatable keys) were removed.
+    expect(checkboxFor("Woo").checked).toBe(false);
+    expect(checkboxFor("Yoast").checked).toBe(false);
+    // The hand-picked up-to-date row on this tab survives.
+    expect(checkboxFor("Akismet").checked).toBe(true);
+    expect(screen.getByText("2 items will be previewed.")).toBeInTheDocument();
+
+    // The other tab's pick survives too.
+    fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
+    expect(checkboxFor("Astra").checked).toBe(true);
+  });
+
+  it("5. the other tab is untouched by Select all", async () => {
+    await openWizard();
+    fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
+    fireEvent.click(checkboxFor("Astra"));
+    fireEvent.click(screen.getByRole("tab", { name: /plugins/i }));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Select all available updates" }),
+    );
+    expect(screen.getByText("3 items will be previewed.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /themes/i }));
+    expect(checkboxFor("Astra").checked).toBe(true);
+    expect(screen.getByText("3 items will be previewed.")).toBeInTheDocument();
+  });
+
+  it("6. no Select all button when the active tab has zero available updates", async () => {
+    const upToDateOnly = buildSite({
+      id: "site-b",
+      components: {
+        plugins: [{ slug: "akismet", name: "Akismet", version: "5.3" }],
+        themes: [],
+      },
+    });
+    await openWizard([upToDateOnly], {
+      kind: "sites",
+      siteIds: ["site-b"],
+      updateKind: "plugins",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(screen.getByText("Akismet")).toBeInTheDocument();
+    // "Deselect all available updates" also matches /select all/i as a
+    // substring, so this one query rules out both button states.
+    expect(
+      screen.queryByRole("button", { name: /select all/i }),
+    ).not.toBeInTheDocument();
   });
 });
